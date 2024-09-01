@@ -1,5 +1,36 @@
 # Example: GitHub Webhooks for GitHub Actions
 
+## Architecture
+
+```mermaid
+graph LR
+  subgraph "GitHub"
+    subgraph "Pull Request"
+      pr[Pull Request]
+    end
+    subgraph "Webhook"
+      ghwebhook[GitHub Webhook]
+    end
+    subgraph "Actions"
+        ghactions[GitHub Workflows]
+    end
+  end
+  subgraph "Google Cloud"
+    subgraph "Cloud Functions"
+      cf[Cloud Functions]
+    end
+    subgraph "Secret Manager"
+      GITHUB_TOKEN[Secret: GITHUB_TOKEN]
+      GITHUB_WEBHOOK_SECRET[Secret: GITHUB_WEBHOOK_SECRET]
+    end
+end
+pr -- /ci slash command --> ghwebhook
+ghwebhook -- GITHUB_WEBHOOK_SECRET --> cf
+GITHUB_WEBHOOK_SECRET --> cf
+GITHUB_TOKEN --> cf
+cf -- GITHUB_TOKEN --> ghactions
+```
+
 ## Setup
 
 1. Generate a new Personal Access Token (GITHUB_TOKEN) in your GitHub settings and copy it to your clipboard.
