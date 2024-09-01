@@ -1,0 +1,14 @@
+name: CI Workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run_ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CI
+        run: |
+          echo "Running CI"
+
