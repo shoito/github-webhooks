@@ -1,5 +1,7 @@
 # Example: GitHub Webhooks for GitHub Actions
 
+Simple example of a GitHub webhook that triggers a GitHub Action workflow when a ci slash command is posted as a comment on a pull request.
+
 ## Architecture
 
 ```mermaid
