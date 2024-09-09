@@ -63,7 +63,7 @@ async function waitForWorkflowCompletion(
   repo: string,
   workflow_id: string,
   ref: string
-): Promise<string> {
+): Promise<{ conclusion: string, runId: number }> {
   let runId: number | undefined;
   
   while (!runId) {
@@ -95,14 +95,14 @@ async function waitForWorkflowCompletion(
 
     if (run.data.status === 'completed') {
       completed = true;
-      conclusion = run.data.conclusion || ''; // "success" か "failure"
+      conclusion = run.data.conclusion || '';
     } else {
       console.log('Workflow still in progress...');
-      await new Promise(resolve => setTimeout(resolve, 5000)); // 5秒待機
+      await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
 
-  return conclusion;
+  return { conclusion, runId };
 }
 
 async function updateStatus(
@@ -110,8 +110,10 @@ async function updateStatus(
   repo: string,
   sha: string,
   state: 'pending' | 'success' | 'failure',
-  description: string
+  description: string,
+  runId?: number
 ): Promise<void> {
+  const target_url = runId ? `https://github.com/${owner}/${repo}/actions/runs/${runId}` : undefined;
   try {
     await octokit.repos.createCommitStatus({
       owner,
@@ -119,11 +121,12 @@ async function updateStatus(
       sha,
       state,
       description,
-      context: 'CI Pipeline'
+      context: 'CI Pipeline',
+      target_url
     });
-    console.log(`Updated status to "${state}" for ${owner}/${repo} @ ${sha}`);
+    console.log(`Updated status to "${state}" for ${target_url || sha}`);
   } catch (error) {
-    console.error('Error updating status:', error);
+    console.error(`Error updating status to "${state}" for ${target_url || sha}`, error);
   }
 }
 
@@ -171,27 +174,27 @@ functions.http('githubWebhook', async (req, res) => {
   }
 
   const module = match[1] || 'all';
+  const workflowId= `ci${module === 'all' ? '' : `-${module}`}.yml`
+  const owner = payload.repository.owner.login;
+  const repo = payload.repository.name;
+  const issueNumber = payload.issue.number;
+
   if (module !== 'all' && !MODULES.includes(module)) {
-    console.log(`Invalid module. Module: ${module}. Issue: ${payload.issue.number}`);
+    console.log(`Invalid module. Module: ${module}. Issue: ${issueNumber}`);
     res.status(200).send('Invalid module');
     return;
   }
 
-  const owner = payload.repository.owner.login;
-  const repo = payload.repository.name;
-  const issueNumber = payload.issue.number;
   const prDetails = await getPullRequestDetails(owner, repo, issueNumber);
-
   if (!prDetails) {
-    console.log(`Pull request not found or error occurred. Issue: ${issueNumber}`);
+    console.log(`Pull request not found or error occurred. workflowId: ${workflowId}, issueNumber: ${issueNumber}`);
     res.status(200).send('Pull request not found or error occurred');
     return;
   }
 
   try {
-    await updateStatus(owner, repo, prDetails.sha, 'pending', 'CI execution started');
-
-    const workflowId= `ci${module === 'all' ? '' : `-${module}`}.yml`
+    console.log(`Triggering workflow for ${workflowId} on branch ${prDetails.ref}`);
+    await updateStatus(owner, repo, prDetails.sha, 'pending', `${workflowId} execution started`);
     await octokit.actions.createWorkflowDispatch({
       owner,
       repo,
@@ -199,19 +202,19 @@ functions.http('githubWebhook', async (req, res) => {
       ref: prDetails.ref,
     });
 
-    const conclusion = await waitForWorkflowCompletion(owner, repo, workflowId, prDetails.ref);
+    const { conclusion, runId } = await waitForWorkflowCompletion(owner, repo, workflowId, prDetails.ref);
 
     if (conclusion === 'success') {
-      await updateStatus(owner, repo, prDetails.sha, 'success', 'CI completed successfully');
+      await updateStatus(owner, repo, prDetails.sha, 'success', `${workflowId} completed successfully`, runId);
     } else {
-      await updateStatus(owner, repo, prDetails.sha, 'failure', 'CI failed');
+      await updateStatus(owner, repo, prDetails.sha, 'failure', `${workflowId} failed`, runId);
     }
 
-    console.log(`CI completed. Issue: ${issueNumber}`);
+    console.log(`${workflowId} completed with conclusion: ${conclusion}, for ${module} on branch ${prDetails.ref}`);
     res.status(200).send(`CI triggered for ${module} on branch ${prDetails.ref}`);
   } catch (error) {
-    console.error(`Error triggering workflow. Issue: ${issueNumber}`, error);
-    await updateStatus(owner, repo, prDetails.sha, 'failure', 'CI failed');
+    console.error(`Error triggering workflow for ${module} on branch ${prDetails.ref}`, error);
+    await updateStatus(owner, repo, prDetails.sha, 'failure', `${workflowId} failed`);
     res.status(500).send('Error triggering workflow');
   }
 });
