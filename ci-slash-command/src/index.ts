@@ -8,6 +8,7 @@ dotenv.config();
 const MODULES = ['frontend', 'backend'];
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
+const GITHUB_API_CALL_INTERVAL = Number.parseInt(process.env.GITHUB_API_INTERVAL || '10000', 10);
 
 interface WebhookPayload {
   action: string;
@@ -58,62 +59,63 @@ async function getPullRequestDetails(owner: string, repo: string, issueNumber: n
   }
 }
 
-async function waitForWorkflowCompletion(
+async function triggerWorkflow(
   owner: string,
   repo: string,
   workflow_id: string,
-  ref: string
-): Promise<{ conclusion: string, runId: number }> {
-  let runId: number | undefined;
-  
-  while (!runId) {
-    const runs = await octokit.actions.listWorkflowRuns({
+  ref: string,
+  inputs: Record<string, string>
+): Promise<number> {
+  try {
+    await octokit.actions.createWorkflowDispatch({
       owner,
       repo,
       workflow_id,
-      branch: ref,
-      status: 'in_progress'
+      ref,
+      inputs
     });
 
-    if (runs.data.workflow_runs.length > 0) {
-      runId = runs.data.workflow_runs[0].id;
-    } else {
-      console.log('Waiting for workflow to start...');
-      await new Promise(resolve => setTimeout(resolve, 5000));
+    let runId: number | undefined;
+    while (!runId) {
+      const runs = await octokit.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id,
+        branch: ref,
+        status: 'in_progress',
+      });
+
+      if (runs.data.workflow_runs.length > 0) {
+        runId = runs.data.workflow_runs[0].id;
+      } else {
+        console.log('Waiting for workflow to start...');
+        await new Promise(resolve => setTimeout(resolve, GITHUB_API_CALL_INTERVAL));
+      }
     }
+
+    return runId;
+  } catch (error) {
+    console.error('Error triggering workflow:', error);
+    throw error;
   }
-
-  let completed = false;
-  let conclusion = '';
-  
-  while (!completed) {
-    const run = await octokit.actions.getWorkflowRun({
-      owner,
-      repo,
-      run_id: runId
-    });
-
-    if (run.data.status === 'completed') {
-      completed = true;
-      conclusion = run.data.conclusion || '';
-    } else {
-      console.log('Workflow still in progress...');
-      await new Promise(resolve => setTimeout(resolve, 5000));
-    }
-  }
-
-  return { conclusion, runId };
 }
 
-async function updateStatus(
+
+async function updateJobStatus(
   owner: string,
   repo: string,
   sha: string,
-  state: 'pending' | 'success' | 'failure',
-  description: string,
-  runId?: number
+  workflowName: string | null | undefined,
+  job: { name: string, status: string, conclusion: string | null, html_url: string | null }
 ): Promise<void> {
-  const target_url = runId ? `https://github.com/${owner}/${repo}/actions/runs/${runId}` : undefined;
+  const state: 'pending' | 'success' | 'failure' =
+    job.conclusion === 'success' ? 'success' :
+    job.conclusion === 'failure' ? 'failure' :
+    'pending';
+
+  const description = job.conclusion ? `${job.conclusion}` : 'In progress';
+  const context = workflowName ? `${workflowName} / ${job.name}` : job.name;
+
   try {
     await octokit.repos.createCommitStatus({
       owner,
@@ -121,12 +123,81 @@ async function updateStatus(
       sha,
       state,
       description,
-      context: 'CI Pipeline',
-      target_url
+      context,
+      target_url: job.html_url,
     });
-    console.log(`Updated status to "${state}" for ${target_url || sha}`);
+
+    console.log(`Updated status for "${context}" to "${state}"`);
   } catch (error) {
-    console.error(`Error updating status to "${state}" for ${target_url || sha}`, error);
+    console.error(`Error updating status for "${context}":`, error);
+  }
+}
+
+async function getWorkflowName(
+  owner: string,
+  repo: string,
+  runId: number
+): Promise<string | null | undefined> {
+  const run = await octokit.actions.getWorkflowRun({
+    owner,
+    repo,
+    run_id: runId,
+  });
+
+  return run.data.name;
+}
+
+async function getJobsForWorkflowRun(
+  owner: string,
+  repo: string,
+  runId: number
+): Promise<{ id: number, name: string, status: string, conclusion: string | null, html_url: string | null }[]> {
+  try {
+    const response = await octokit.actions.listJobsForWorkflowRun({
+      owner,
+      repo,
+      run_id: runId,
+    });
+
+    const jobs = response.data.jobs.map(job => ({
+      id: job.id,
+      name: job.name,
+      status: job.status,
+      conclusion: job.conclusion,
+      html_url: job.html_url,
+    }));
+
+    return jobs;
+  } catch (error) {
+    console.error('Error fetching jobs for workflow run:', error);
+    throw error;
+  }
+}
+
+async function monitorWorkflowJobs(
+  owner: string,
+  repo: string,
+  runId: number,
+  sha: string
+): Promise<void> {
+  let completed = false;
+  const workflowName = await getWorkflowName(owner, repo, runId);
+
+  while (!completed) {
+    const jobs = await getJobsForWorkflowRun(owner, repo, runId);
+
+    for (const job of jobs) {
+      if (job.status === 'completed') {
+        await updateJobStatus(owner, repo, sha, workflowName, job);
+      } else if (job.status === 'in_progress') {
+        await updateJobStatus(owner, repo, sha, workflowName, job);
+      }
+    }
+
+    completed = jobs.every(job => job.status === 'completed');
+    if (!completed) {
+      await new Promise(resolve => setTimeout(resolve, GITHUB_API_CALL_INTERVAL));
+    }
   }
 }
 
@@ -194,27 +265,12 @@ functions.http('githubWebhook', async (req, res) => {
 
   try {
     console.log(`Triggering workflow for ${workflowId} on branch ${prDetails.ref}`);
-    await updateStatus(owner, repo, prDetails.sha, 'pending', `${workflowId} execution started`);
-    await octokit.actions.createWorkflowDispatch({
-      owner,
-      repo,
-      workflow_id: workflowId,
-      ref: prDetails.ref,
-    });
+    const runId = await triggerWorkflow(owner, repo, workflowId, prDetails.ref, {});
+    await monitorWorkflowJobs(owner, repo, runId, prDetails.sha);
 
-    const { conclusion, runId } = await waitForWorkflowCompletion(owner, repo, workflowId, prDetails.ref);
-
-    if (conclusion === 'success') {
-      await updateStatus(owner, repo, prDetails.sha, 'success', `${workflowId} completed successfully`, runId);
-    } else {
-      await updateStatus(owner, repo, prDetails.sha, 'failure', `${workflowId} failed`, runId);
-    }
-
-    console.log(`${workflowId} completed with conclusion: ${conclusion}, for ${module} on branch ${prDetails.ref}`);
     res.status(200).send(`CI triggered for ${module} on branch ${prDetails.ref}`);
   } catch (error) {
     console.error(`Error triggering workflow for ${module} on branch ${prDetails.ref}`, error);
-    await updateStatus(owner, repo, prDetails.sha, 'failure', `${workflowId} failed`);
     res.status(500).send('Error triggering workflow');
   }
 });
