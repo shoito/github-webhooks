@@ -1,6 +1,6 @@
-# Example: GitHub Webhooks for GitHub Actions
+# ci-slash-command - GitHub Webhooks for GitHub Actions
 
-Simple example of a GitHub webhook that triggers a GitHub Action workflow when a ci slash command is posted as a comment on a pull request.
+ci-slash-command is a GitHub Webhooks that allows you to trigger GitHub Actions workflows using a `/ci` slash command in a pull request comment.
 
 ## Architecture
 

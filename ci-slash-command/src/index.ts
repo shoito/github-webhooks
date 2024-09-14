@@ -1,3 +1,9 @@
+/**
+ * This function listens for issue comments on GitHub repositories and triggers a GitHub Actions
+ * workflow based on the comment. The comment should be in the format `/ci [module]` where `module`
+ * is an optional parameter that specifies the module to trigger the workflow for. If no module is
+ * specified, the workflow for all modules will be triggered.
+ */
 import crypto from 'node:crypto';
 import * as functions from '@google-cloud/functions-framework';
 import { Octokit } from '@octokit/rest';
@@ -5,7 +11,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const MODULES = ['frontend', 'backend'];
+/**
+ * The CI workflows for each module. The key is the module name and the value is the workflow ID.
+ * The value is base64 encoded.
+ * e.g. { "frontend": "ci-frontend.yaml", "backend": "ci-backend.yaml", "all": "ci.yaml" }
+ */
+const MODULE_CI_WORKFLOWS = JSON.parse(atob(process.env.MODULE_CI_WORKFLOWS || ''));
+
+const MODULES = Object.keys(MODULE_CI_WORKFLOWS);
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 const GITHUB_API_CALL_INTERVAL = Number.parseInt(process.env.GITHUB_API_INTERVAL || '10000', 10);
@@ -14,6 +27,9 @@ interface WebhookPayload {
   action: string;
   issue?: {
     number: number;
+    pull_request?: {
+      url: string;
+    };
   };
   comment?: {
     body: string;
@@ -224,13 +240,13 @@ functions.http('githubWebhook', async (req, res) => {
   const event = req.headers['x-github-event'] as string;
   if (event !== 'issue_comment') {
     console.log(`Event not related to issue comments. Event: ${event}`);
-    res.status(200).send('Event not related to issue comments');
+    res.status(400).send('Event not related to issue comments');
     return;
   }
 
   const payload = req.body as WebhookPayload;
-  if (payload.action !== 'created' || !payload.comment || !payload.issue) {
-    console.log(`No action needed. Action: ${payload.action}. Comment: ${payload.comment}. Issue: ${payload.issue?.number}`);
+  if (payload.action !== 'created' || !payload.issue?.pull_request || !payload.comment || !payload.issue) {
+    console.log(`No action needed. Action: ${payload.action}. Issue: ${payload.issue?.number}`);
     res.status(200).send('No action needed');
     return;
   }
@@ -239,38 +255,37 @@ functions.http('githubWebhook', async (req, res) => {
   const ciRegex = /^\/ci(?:\s+(\w+))?$/;
   const match = commentBody.match(ciRegex);
   if (!match) {
-    console.log(`No CI command found. Comment: ${commentBody}. Issue: ${payload.issue.number}`);
+    console.log(`No CI command found. Issue: ${payload.issue.number}`);
     res.status(200).send('No CI command found');
     return;
   }
 
-  const module = match[1] || 'all';
-  const workflowId= `ci${module === 'all' ? '' : `-${module}`}.yml`
   const owner = payload.repository.owner.login;
   const repo = payload.repository.name;
-  const issueNumber = payload.issue.number;
-
+  const issueNumber = payload.issue?.number;
+  const module = match[1] || 'all';
   if (module !== 'all' && !MODULES.includes(module)) {
     console.log(`Invalid module. Module: ${module}. Issue: ${issueNumber}`);
-    res.status(200).send('Invalid module');
+    res.status(400).send('Invalid module');
     return;
   }
 
   const prDetails = await getPullRequestDetails(owner, repo, issueNumber);
   if (!prDetails) {
-    console.log(`Pull request not found or error occurred. workflowId: ${workflowId}, issueNumber: ${issueNumber}`);
-    res.status(200).send('Pull request not found or error occurred');
+    console.log(`Pull request not found or error occurred. issueNumber: ${issueNumber}`);
+    res.status(400).send('Pull request not found or error occurred');
     return;
   }
+  
+  // GitHub Webhook requires a response within 10 seconds. So, we respond immediately and trigger the CI.
+  res.status(202).send(`CI triggered for ${module} on branch ${prDetails.ref}`);
 
+  const workflowId = MODULE_CI_WORKFLOWS[module];
   try {
     console.log(`Triggering workflow for ${workflowId} on branch ${prDetails.ref}`);
     const runId = await triggerWorkflow(owner, repo, workflowId, prDetails.ref, {});
     await monitorWorkflowJobs(owner, repo, runId, prDetails.sha);
-
-    res.status(200).send(`CI triggered for ${module} on branch ${prDetails.ref}`);
   } catch (error) {
     console.error(`Error triggering workflow for ${module} on branch ${prDetails.ref}`, error);
-    res.status(500).send('Error triggering workflow');
   }
 });
